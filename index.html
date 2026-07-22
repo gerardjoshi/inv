@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Minimalist Inventory</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <script src="https://cdn.jsdelivr.net/npm/fuse.js/dist/fuse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/idb-keyval@6/dist/umd.js"></script>
+
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        font-family: "DM Sans", sans-serif;
+        color: #000000;
+      }
+      body {
+        background-color: #ffffff;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      #top-half {
+        flex: 1;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+      }
+      #bottom-half {
+        flex: 1;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding-bottom: 2rem;
+      }
+      input {
+        appearance: none;
+        border: none;
+        background: transparent;
+        outline: none;
+        text-align: center;
+        font-size: 1.5rem;
+        width: 80%;
+        max-width: 600px;
+      }
+      input::placeholder {
+        color: #808080;
+      }
+      .row {
+        display: flex;
+        gap: 1.5rem;
+        margin-bottom: 1rem;
+        font-size: 1.2rem;
+        align-items: center;
+      }
+      .action-text {
+        cursor: pointer;
+        user-select: none;
+        font-weight: 700;
+      }
+      #add-btn {
+        cursor: pointer;
+        font-size: 1.2rem;
+        margin-top: 1rem;
+        font-weight: 700;
+        display: none;
+      }
+      #loading-text {
+        font-size: 1.2rem;
+        margin-top: 1rem;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="top-half">
+      <input type="text" id="search-input" placeholder="type item name" />
+    </div>
+
+    <div id="bottom-half">
+      <div id="loading-text">Loading...</div>
+      <div id="results-container"></div>
+      <div id="add-btn">add item</div>
+    </div>
+
+    <script>
+      // CONFIGURATION: Paste your AWS Lambda Function URL here
+      const AWS_LAMBDA_URL = "YOUR_LAMBDA_FUNCTION_URL_HERE";
+
+      const searchInput = document.getElementById("search-input");
+      const resultsContainer = document.getElementById("results-container");
+      const addBtn = document.getElementById("add-btn");
+      const loadingText = document.getElementById("loading-text");
+
+      let appData = { items: [], lastUpdated: 0 };
+      let masterPassword = "";
+
+      async function initializeApp() {
+        // 1. Secure Password Vault Check
+        masterPassword = await idbKeyval.get("inventory-password");
+        if (!masterPassword) {
+          masterPassword = prompt("Enter Master Password:");
+          if (masterPassword) {
+            await idbKeyval.set("inventory-password", masterPassword);
+          } else {
+            loadingText.textContent =
+              "Authentication Required. Refresh to try again.";
+            return;
+          }
+        }
+
+        // 2. Load Local Data
+        const localData = await idbKeyval.get("inventory-data");
+        if (localData) appData = localData;
+
+        // 3. Sync with AWS (Optimistic Local-First)
+        await syncWithAWS();
+
+        loadingText.style.display = "none";
+        renderResults();
+      }
+
+      async function syncWithAWS() {
+        try {
+          // Fetch AWS version
+          const response = await fetch(AWS_LAMBDA_URL, {
+            method: "GET",
+            headers: { Authorization: masterPassword },
+          });
+
+          if (response.status === 401) {
+            alert("Invalid Password. Clearing local vault.");
+            await idbKeyval.del("inventory-password");
+            location.reload();
+            return;
+          }
+
+          const awsData = await response.json();
+
+          // Compare Timestamps
+          if (awsData.lastUpdated > appData.lastUpdated) {
+            appData = awsData;
+            await idbKeyval.set("inventory-data", appData); // Save cloud version locally
+          } else if (appData.lastUpdated > awsData.lastUpdated) {
+            await pushToAWS(); // Push offline changes to cloud
+          }
+        } catch (err) {
+          console.error("Sync failed (likely offline). Using local data.", err);
+        }
+      }
+
+      async function pushToAWS() {
+        try {
+          await fetch(AWS_LAMBDA_URL, {
+            method: "POST",
+            headers: {
+              Authorization: masterPassword,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(appData),
+          });
+        } catch (err) {
+          console.error("AWS push failed. Changes saved locally.", err);
+        }
+      }
+
+      async function saveAndSync() {
+        appData.lastUpdated = Date.now(); // Update timestamp to exact millisecond
+        await idbKeyval.set("inventory-data", appData); // Save locally instantly
+        renderResults(); // Update UI instantly
+        pushToAWS(); // Sync in background
+      }
+
+      function renderResults() {
+        resultsContainer.innerHTML = "";
+        addBtn.style.display = "none";
+
+        const query = searchInput.value.trim();
+        const lowerQuery = query.toLowerCase();
+        if (query === "") return;
+
+        let results = [];
+        if (lowerQuery === "all") {
+          results = appData.items;
+        } else {
+          const fuse = new Fuse(appData.items, {
+            keys: ["name"],
+            threshold: 0.4,
+          });
+          results = fuse.search(query).map((result) => result.item);
+        }
+
+        results.forEach((item) => {
+          const row = document.createElement("div");
+          row.className = "row";
+
+          const nameText = document.createElement("span");
+          nameText.textContent = item.name;
+
+          const countText = document.createElement("span");
+          countText.textContent = item.count;
+
+          const plusText = document.createElement("span");
+          plusText.textContent = "+1";
+          plusText.className = "action-text";
+          plusText.onclick = () => updateCount(item.id, 1);
+
+          const minusText = document.createElement("span");
+          minusText.textContent = "-1";
+          minusText.className = "action-text";
+          minusText.onclick = () => updateCount(item.id, -1);
+
+          row.append(nameText, countText, plusText, minusText);
+          resultsContainer.appendChild(row);
+        });
+
+        if (
+          lowerQuery !== "all" &&
+          !appData.items.find((i) => i.name.toLowerCase() === lowerQuery)
+        ) {
+          addBtn.style.display = "block";
+        }
+      }
+
+      async function updateCount(id, delta) {
+        const index = appData.items.findIndex((i) => i.id === id);
+        if (index !== -1) {
+          appData.items[index].count += delta;
+          if (appData.items[index].count <= 0) appData.items.splice(index, 1);
+          await saveAndSync();
+        }
+      }
+
+      async function addNewItem() {
+        const name = searchInput.value.trim();
+        if (name === "" || name.toLowerCase() === "all") return;
+        appData.items.push({ id: Date.now().toString(), name, count: 1 });
+        await saveAndSync();
+      }
+
+      searchInput.addEventListener("input", renderResults);
+      addBtn.addEventListener("click", addNewItem);
+      window.addEventListener("DOMContentLoaded", initializeApp);
+    </script>
+  </body>
+</html>
